@@ -8,6 +8,7 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
 use ratatui::symbols::Marker;
 use ratatui::widgets::Block;
+use ratatui::widgets::Gauge;
 use ratatui::widgets::canvas::Canvas;
 use ratatui::widgets::canvas::Line;
 use rodio::OutputStreamHandle;
@@ -15,6 +16,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use rodio::{OutputStream, Source};
+
+mod widget;
 
 #[derive(Clone, Copy)]
 struct Vec2 {
@@ -107,6 +110,11 @@ impl VoiceManager {
     }
 
     fn note_on(&mut self, frequency: f32, key: char) {
+        let active = self.voices.iter().any(|v| v.active && v.key == Some(key));
+        if active {
+            // Voice is already active, so skip it
+            return;
+        }
         let mut osc = WavetableOscillator::new(self.sample_rate, self.wave_table.clone());
         osc.set_frequency(frequency);
         osc.note_on();
@@ -145,13 +153,16 @@ impl VoiceManager {
 struct StreamingSource {
     voice_manager: Arc<Mutex<VoiceManager>>,
     sample_rate: u32,
+    master_volume: Arc<Mutex<f32>>,
 }
 
 impl Iterator for StreamingSource {
     type Item = f32;
 
     fn next(&mut self) -> Option<Self::Item> {
-        Some(self.voice_manager.lock().unwrap().mix_sample())
+        let volume = *self.master_volume.lock().unwrap();
+        let sample = self.voice_manager.lock().unwrap().mix_sample();
+        Some(sample * volume)
     }
 }
 
@@ -173,15 +184,16 @@ impl Source for StreamingSource {
 }
 
 pub struct App {
-    should_quit: bool,
-    terminal_size: Vec2,
-    voice_manager: Arc<Mutex<VoiceManager>>,
     stream: OutputStream,
     stream_handle: OutputStreamHandle,
+    wave_table_size: u16,
+    sample_rate: u32,
     wave_table: Arc<Vec<f32>>,
+    voice_manager: Arc<Mutex<VoiceManager>>,
+    master_volume: Arc<Mutex<f32>>,
 
-    master_volume: f32,
-
+    terminal_size: Vec2,
+    should_quit: bool,
     events: Vec<String>,
 }
 impl App {
@@ -190,35 +202,44 @@ impl App {
             OutputStream::try_default().expect("Expected a stream and stream handle");
 
         let wave_table_size = 256;
+        let sample_rate = 44100;
 
-        let wave_table: Arc<Vec<f32>> = Arc::new(generate_wave_table(Waveform::Saw, 256));
-        let voice_manager = Arc::new(Mutex::new(VoiceManager::new(44100, wave_table.clone())));
+        let wave_table: Arc<Vec<f32>> =
+            Arc::new(generate_wave_table(Waveform::Sine, wave_table_size));
+        let voice_manager = Arc::new(Mutex::new(VoiceManager::new(
+            sample_rate,
+            wave_table.clone(),
+        )));
+
+        let master_volume = Arc::new(Mutex::new(1.0));
 
         let src = StreamingSource {
             voice_manager: Arc::clone(&voice_manager),
-            sample_rate: 44100,
+            sample_rate,
+            master_volume: master_volume.clone(),
         };
 
         stream_handle.play_raw(src.convert_samples()).unwrap();
 
-        let master_volume = 1.0;
-
         let events = Vec::new();
 
         Self {
-            should_quit: false,
-            terminal_size: Vec2 { x: 10.0, y: 10.0 },
-            voice_manager,
             stream,
             stream_handle,
+            wave_table_size,
+            sample_rate,
             wave_table,
+            voice_manager,
             master_volume,
+
+            terminal_size: Vec2 { x: 10.0, y: 10.0 },
+            should_quit: false,
             events,
         }
     }
 
     fn get_event(&self) -> Result<Option<Event>> {
-        if event::poll(core::time::Duration::from_millis(500))? {
+        if event::poll(core::time::Duration::from_millis(10))? {
             // It's guaranteed that the `read()` won't block when the `poll()`
             // function returns `true`
             Ok(Some(event::read()?))
@@ -235,6 +256,8 @@ impl App {
                 KeyCode::Char('2') => Ok(Action::ChangeWavetable(Waveform::Saw)),
                 KeyCode::Char('3') => Ok(Action::ChangeWavetable(Waveform::Square)),
                 KeyCode::Char('4') => Ok(Action::ChangeWavetable(Waveform::Triangle)),
+                KeyCode::Char('+') => Ok(Action::IncreaseVolume),
+                KeyCode::Char('-') => Ok(Action::DecreaseVolume),
 
                 KeyCode::Char(c) => {
                     let freq = match c {
@@ -287,9 +310,21 @@ impl App {
             }
             Action::NoteOff(char) => self.voice_manager.lock().unwrap().note_off(char),
             Action::ChangeWavetable(waveform) => {
-                let new_wavetable = Arc::new(generate_wave_table(waveform, 256));
+                let new_wavetable = Arc::new(generate_wave_table(waveform, self.wave_table_size));
                 self.wave_table = Arc::clone(&new_wavetable);
                 self.voice_manager.lock().unwrap().wave_table = Arc::clone(&new_wavetable);
+            }
+            Action::IncreaseVolume => {
+                let mut volume = self.master_volume.lock().unwrap();
+                if *volume < 1.0 {
+                    *volume += 0.05
+                }
+            }
+            Action::DecreaseVolume => {
+                let mut volume = self.master_volume.lock().unwrap();
+                if *volume > 0.05 {
+                    *volume -= 0.05
+                }
             }
             Action::None => (),
 
@@ -304,6 +339,8 @@ enum Action {
     NoteOn(f32, char),
     NoteOff(char),
     ChangeWavetable(Waveform),
+    IncreaseVolume,
+    DecreaseVolume,
     None,
 }
 
@@ -314,7 +351,7 @@ enum Waveform {
     Triangle,
 }
 
-fn generate_wave_table(waveform: Waveform, size: usize) -> Vec<f32> {
+fn generate_wave_table(waveform: Waveform, size: u16) -> Vec<f32> {
     match waveform {
         Waveform::Sine => (0..size)
             .map(|n| (2.0 * std::f32::consts::PI * n as f32 / size as f32).sin())
@@ -335,35 +372,38 @@ fn generate_wave_table(waveform: Waveform, size: usize) -> Vec<f32> {
 }
 
 pub fn run(app: &mut App, mut terminal: DefaultTerminal) -> Result<()> {
+    let bg_color = Color::Rgb(25, 50, 50);
+    let fg_color = Color::Rgb(255, 123, 0);
+    let accent_color = Color::Rgb(196, 255, 0);
+
+    let mut phase = 0.0;
     loop {
         terminal.draw(|frame| {
             let screen_area = frame.area();
-            let screen_block = Block::bordered().title("Synthesizer").style(
-                Style::default()
-                    .fg(Color::Rgb(255, 123, 0))
-                    .bg(Color::Rgb(25, 50, 50)),
-            );
+            let screen_block = Block::bordered()
+                .title("Synthesizer")
+                .style(Style::default().fg(fg_color).bg(bg_color));
             frame.render_widget(screen_block, screen_area);
 
             let waveform_area = Rect::new(
-                (frame.area().width as f32 * 0.3) as u16,
-                (frame.area().height as f32 * 0.3) as u16,
-                (frame.area().width as f32 * 0.4) as u16,
-                (frame.area().height as f32 * 0.4) as u16,
-            );
-            let waveform_block = Block::bordered().style(
-                Style::default()
-                    .fg(Color::Rgb(255, 123, 0))
-                    .bg(Color::Rgb(25, 50, 50)),
+                (frame.area().width as f32 * 0.3) as u16,  // X
+                (frame.area().height as f32 * 0.1) as u16, // Y
+                (frame.area().width as f32 * 0.4) as u16,  // Width
+                (frame.area().height as f32 * 0.4) as u16, // Height
             );
 
+            phase += 0.05;
+            if phase > 2.0 {
+                phase -= 2.0
+            }
             let resolution = app.wave_table.len();
             let data: Vec<(f64, f64)> = app
                 .wave_table
                 .iter()
                 .enumerate()
                 .map(|(i, &sample)| {
-                    let x = i as f64 / resolution as f64 * 2.0 - 1.0;
+                    let mut x = (i as f64 / resolution as f64 * 2.0 - 1.0) + phase;
+                    x = ((x + 1.0) % 2.0 + 2.0) % 2.0 - 1.0;
                     let y = sample as f64;
                     (x, y)
                 })
@@ -371,24 +411,28 @@ pub fn run(app: &mut App, mut terminal: DefaultTerminal) -> Result<()> {
 
             let canvas = Canvas::default()
                 .block(Block::bordered().title("Wavetable"))
-                .marker(Marker::Braille)
+                .background_color(bg_color)
+                .marker(Marker::HalfBlock)
                 .x_bounds([-1.0, 1.0])
                 .y_bounds([-1.0, 1.0])
                 .paint(|ctx| {
                     for i in 1..data.len() {
-                        let (x1, y1) = data[i - 1];
-                        let (x2, y2) = data[i];
-                        ctx.draw(&Line {
-                            x1,
-                            y1,
-                            x2,
-                            y2,
-                            color: Color::Cyan,
+                        let (x, y) = data[i];
+                        ctx.draw(&ratatui::widgets::canvas::Points {
+                            coords: &[(x, y)],
+                            color: accent_color,
                         });
                     }
                 });
 
             frame.render_widget(canvas, waveform_area);
+            let volume = app.master_volume.lock().unwrap();
+            let volume_gauge = Gauge::default()
+                .block(Block::default().title("Volume"))
+                .gauge_style(Style::default().fg(fg_color))
+                .ratio(*volume as f64);
+            let gauge_area = Rect::new(2, 2, 3, 10);
+            frame.render_widget(volume_gauge, gauge_area);
         })?;
 
         let event = app.get_event()?;
